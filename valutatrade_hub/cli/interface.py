@@ -1,6 +1,11 @@
 import argparse
 import shlex
 
+from valutatrade_hub.core.exceptions import (
+    ApiRequestError,
+    CurrencyNotFoundError,
+    InsufficientFundsError,
+)
 from valutatrade_hub.core.models import User
 from valutatrade_hub.core.usecases import (
     buy,
@@ -28,15 +33,37 @@ def create_parser() -> argparse.ArgumentParser:
     portfolio_parser = commands.add_parser("show-portfolio")
     portfolio_parser.add_argument("--base", default="USD")
 
-    buy_parser = commands.add_parser("buy")
+    buy_parser = commands.add_parser(
+        "buy",
+        description="Покупка валюты за USD.",
+        epilog=(
+            "Ошибки: InsufficientFundsError — недостаточно USD; "
+            "CurrencyNotFoundError — неизвестная валюта."
+        ),
+    )
     buy_parser.add_argument("--currency", required=True)
     buy_parser.add_argument("--amount", required=True, type=float)
 
-    sell_parser = commands.add_parser("sell")
+    sell_parser = commands.add_parser(
+        "sell",
+        description="Продажа валюты за USD.",
+        epilog=(
+            "Ошибки: InsufficientFundsError — недостаточно валюты; "
+            "CurrencyNotFoundError — неизвестная валюта."
+        ),
+    )
     sell_parser.add_argument("--currency", required=True)
     sell_parser.add_argument("--amount", required=True, type=float)
 
-    rate_parser = commands.add_parser("get-rate")
+    rate_parser = commands.add_parser(
+        "get-rate",
+        description="Получение прямого и обратного валютного курса.",
+        epilog=(
+            "Ошибки: CurrencyNotFoundError — неизвестная валюта; "
+            "ApiRequestError — ошибка внешнего API. "
+            "Поддерживаемые коды: USD, EUR, RUB, BTC, ETH."
+        ),
+    )
     rate_parser.add_argument("--from", dest="from_currency", required=True)
     rate_parser.add_argument("--to", dest="to_currency", required=True)
 
@@ -47,7 +74,7 @@ def main() -> None:
     """Запускает интерактивную консоль с текущей сессией пользователя."""
     parser = create_parser()
     current_user: User | None = None
-    print("ValutaTrade Hub. Для списка команд введите help, для выхода — exit.")
+    print("CurrencyTrade Hub. Для списка команд введите help, для выхода — exit.")
 
     while True:
         try:
@@ -89,6 +116,14 @@ def main() -> None:
                 print(sell(current_user, args.currency, args.amount))
             elif args.command == "get-rate":
                 print(get_rate(args.from_currency, args.to_currency))
+        except InsufficientFundsError as exc:
+            print(f"Ошибка сделки: {exc}")
+        except CurrencyNotFoundError as exc:
+            print(f"Ошибка валюты: {exc}")
+            print("Поддерживаемые коды: USD, EUR, RUB, BTC, ETH.")
+        except ApiRequestError as exc:
+            print(f"Ошибка получения курса: {exc}")
+            print("Повторите попытку позже или проверьте подключение к сети.")
         except (ValueError, TypeError, KeyError, FileNotFoundError) as exc:
             print(f"Ошибка: {exc}")
 
