@@ -1,10 +1,10 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from math import isfinite
 from secrets import token_hex
 
 from valutatrade_hub.core.currencies import get_currency
-from valutatrade_hub.core.exceptions import InsufficientFundsError
-from valutatrade_hub.core.models import EXCHANGE_RATES, Portfolio, User
+from valutatrade_hub.core.exceptions import ApiRequestError, InsufficientFundsError
+from valutatrade_hub.core.models import Portfolio, User
 from valutatrade_hub.decorators import log_action, set_action_context
 from valutatrade_hub.infra.database import DatabaseManager
 from valutatrade_hub.infra.settings import SettingsLoader
@@ -139,11 +139,91 @@ def login(username: str, password: str) -> User:
     raise ValueError(f"Пользователь '{username}' не найден")
 
 
+def _load_quotes() -> tuple[dict, datetime, float]:
+    """Читает снимок курсов Parser Service и параметры актуальности."""
+    ttl_seconds = SettingsLoader().get("rates_ttl_seconds", 300)
+
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, (int, float))
+        or not isfinite(ttl_seconds)
+        or ttl_seconds < 0
+    ):
+        raise ValueError("TTL курсов должен быть конечным неотрицательным числом")
+
+    cache = DatabaseManager().read("rates")
+
+    if not isinstance(cache, dict):
+        raise ApiRequestError("Некорректный формат кеша. Выполните update-rates.")
+
+    pairs = cache.get("pairs", {})
+
+    if not isinstance(pairs, dict):
+        raise ApiRequestError("Некорректный формат кеша. Выполните update-rates.")
+
+    return pairs, datetime.now(UTC), float(ttl_seconds)
+
+
+def _usd_quote(
+    code: str,
+    pairs: dict,
+    now: datetime,
+    ttl_seconds: float,
+) -> tuple[float, datetime]:
+    """Возвращает цену одной единицы валюты в USD из свежего кеша."""
+    if code == "USD":
+        return 1.0, now
+
+    for pair, inverse in ((f"{code}_USD", False), (f"USD_{code}", True)):
+        entry = pairs.get(pair)
+
+        if not isinstance(entry, dict):
+            continue
+
+        rate = entry.get("rate")
+        timestamp = entry.get("updated_at")
+
+        if (
+            isinstance(rate, bool)
+            or not isinstance(rate, (int, float))
+            or not isinstance(timestamp, str)
+            or not isfinite(rate)
+            or rate <= 0
+        ):
+            continue
+
+        try:
+            updated_at = datetime.fromisoformat(timestamp)
+        except ValueError:
+            continue
+
+        if updated_at.tzinfo is None or updated_at.utcoffset() is None:
+            continue
+
+        updated_at = updated_at.astimezone(UTC)
+        age_seconds = (now - updated_at).total_seconds()
+
+        if not 0 <= age_seconds < ttl_seconds:
+            continue
+
+        price = 1.0 / rate if inverse else float(rate)
+
+        if not isfinite(price) or price <= 0:
+            continue
+
+        return price, updated_at
+
+    raise ApiRequestError(
+        f"Курс {code}_USD отсутствует или устарел. "
+        "Выполните update-rates для обновления курсов."
+    )
+
+
 def show_portfolio(
     user: User | None,
     base_currency: str = "USD",
 ) -> str:
-    """Показывает кошельки пользователя и их стоимость в базовой валюте."""
+    """Показывает кошельки с оценкой по актуальным курсам Parser Service."""
     user = _require_user(user)
 
     if not isinstance(base_currency, str) or not base_currency.strip():
@@ -157,12 +237,15 @@ def show_portfolio(
         return f"Портфель пользователя '{user.username}' пуст"
 
     portfolio = _restore_portfolio(user, record)
-
+    pairs, now, ttl_seconds = _load_quotes()
+    base_rate, _ = _usd_quote(base_code, pairs, now, ttl_seconds)
     lines = [f"Портфель пользователя '{user.username}' (база: {base_code}):"]
+    total = 0.0
 
     for wallet in portfolio.wallets.values():
-        rate = EXCHANGE_RATES[wallet.currency_code] / EXCHANGE_RATES[base_code]
-        value = wallet.balance * rate
+        usd_rate, _ = _usd_quote(wallet.currency_code, pairs, now, ttl_seconds)
+        value = wallet.balance * usd_rate / base_rate
+        total += value
         precision = 4 if wallet.currency_code in {"BTC", "ETH"} else 2
 
         lines.append(
@@ -172,8 +255,7 @@ def show_portfolio(
         )
 
     lines.append("-" * 33)
-    lines.append(f"ИТОГО: {portfolio.get_total_value(base_code):,.2f} {base_code}")
-
+    lines.append(f"ИТОГО: {total:,.2f} {base_code}")
     return "\n".join(lines)
 
 
@@ -192,7 +274,8 @@ def buy(user: User | None, currency_code: str, amount: float) -> str:
     if code == "USD":
         raise ValueError("Нельзя купить USD за USD")
 
-    rate = EXCHANGE_RATES[code]
+    pairs, now, ttl_seconds = _load_quotes()
+    rate, _ = _usd_quote(code, pairs, now, ttl_seconds)
     set_action_context(rate=rate, base="USD")
     cost = amount * rate
 
@@ -256,7 +339,8 @@ def sell(user: User | None, currency_code: str, amount: float) -> str:
     if code == "USD":
         raise ValueError("Нельзя продать USD за USD")
 
-    rate = EXCHANGE_RATES[code]
+    pairs, now, ttl_seconds = _load_quotes()
+    rate, _ = _usd_quote(code, pairs, now, ttl_seconds)
     set_action_context(rate=rate, base="USD")
     proceeds = amount * rate
 
@@ -306,7 +390,7 @@ def sell(user: User | None, currency_code: str, amount: float) -> str:
 
 
 def get_rate(from_currency: str, to_currency: str) -> str:
-    """Возвращает курс из свежего кеша либо демонстрационной заглушки."""
+    """Возвращает прямой и обратный курс из актуального кеша Parser Service."""
     if not isinstance(from_currency, str) or not from_currency.strip():
         raise ValueError("Исходная валюта не может быть пустой")
 
@@ -315,71 +399,20 @@ def get_rate(from_currency: str, to_currency: str) -> str:
 
     from_code = get_currency(from_currency).code
     to_code = get_currency(to_currency).code
+    pairs, now, ttl_seconds = _load_quotes()
+    from_usd, from_updated = _usd_quote(from_code, pairs, now, ttl_seconds)
+    to_usd, to_updated = _usd_quote(to_code, pairs, now, ttl_seconds)
+    rate = from_usd / to_usd
 
-    database = DatabaseManager()
-    cache = database.read("rates")
-    now = datetime.now(UTC)
+    if not isfinite(rate) or rate <= 0:
+        raise ApiRequestError("Некорректное значение рассчитанного курса.")
 
-    ttl_seconds = SettingsLoader().get("rates_ttl_seconds", 300)
+    reverse_rate = 1.0 / rate
 
-    if not isinstance(ttl_seconds, (int, float)) or not isfinite(ttl_seconds):
-        raise ValueError("TTL курсов должен быть конечным числом")
+    if not isfinite(reverse_rate) or reverse_rate <= 0:
+        raise ApiRequestError("Некорректное значение обратного курса.")
 
-    if ttl_seconds < 0:
-        raise ValueError("TTL курсов не может быть отрицательным")
-
-    ttl = timedelta(seconds=ttl_seconds)
-    rate: float | None = None
-    updated_at = now
-
-    for key, inverse in (
-        (f"{from_code}_{to_code}", False),
-        (f"{to_code}_{from_code}", True),
-    ):
-        record = cache.get(key)
-
-        if not isinstance(record, dict):
-            continue
-
-        try:
-            cached_at = datetime.fromisoformat(record["updated_at"])
-            cached_rate = float(record["rate"])
-        except (KeyError, TypeError, ValueError, AttributeError):
-            continue
-
-        if cached_at.tzinfo is None:
-            cached_at = cached_at.replace(tzinfo=UTC)
-
-        if not timedelta(0) <= now - cached_at < ttl:
-            continue
-
-        if not isfinite(cached_rate) or cached_rate <= 0:
-            continue
-
-        candidate = 1 / cached_rate if inverse else cached_rate
-
-        if not isfinite(candidate) or candidate <= 0 or not isfinite(1 / candidate):
-            continue
-
-        rate = candidate
-        updated_at = cached_at
-        break
-
-    if rate is None:
-        rate = EXCHANGE_RATES[from_code] / EXCHANGE_RATES[to_code]
-
-        def refresh(rates: dict) -> dict:
-            rates[f"{from_code}_{to_code}"] = {
-                "rate": rate,
-                "updated_at": now.isoformat(),
-            }
-            rates["source"] = "Stub"
-            rates["last_refresh"] = now.isoformat()
-            return rates
-
-        database.update("rates", refresh)
-
-    reverse_rate = 1 / rate
+    updated_at = min(from_updated, to_updated)
     rate_text = f"{rate:.8f}" if rate < 1 else f"{rate:.2f}"
     reverse_text = f"{reverse_rate:.8f}" if reverse_rate < 1 else f"{reverse_rate:.2f}"
 
