@@ -1,4 +1,3 @@
-
 # CurrencyTrade Hub
 
 CurrencyTrade Hub — консольное приложение на Python для отслеживания валютных портфелей, симуляции покупки и продажи валют и получения валютных курсов из внешних API.
@@ -68,6 +67,7 @@ CurrencyTrade Hub — консольное приложение на Python дл
 - `ExchangeRateApiClient` — получение фиатных курсов.
 - `RatesStorage` — хранение актуальных курсов и истории.
 - `RatesUpdater` — координация обновления курсов.
+- `rate_queries.py` (`RateQuote`, `RateListing`, `query_rates`) — проверка TTL, фильтрация курсов и пересчёт котировок без привязки к отображению в CLI.
 
 ### Infrastructure
 
@@ -77,7 +77,7 @@ CurrencyTrade Hub — консольное приложение на Python дл
 
 ### CLI
 
-Предоставляет интерактивный интерфейс для пользователей и команды управления Parser Service.
+Предоставляет интерактивный интерфейс для пользователей и команды управления Parser Service. CLI обрабатывает аргументы и отображает результаты в PrettyTable; проверку и пересчёт курсов выполняет `parser_service/rate_queries.py`.
 
 ## Структура проекта
 
@@ -112,7 +112,8 @@ finalproject_EDianov_M26-555/
 │   │   ├── config.py
 │   │   ├── api_clients.py
 │   │   ├── storage.py
-│   │   └── updater.py
+│   │   ├── updater.py
+│   │   └── rate_queries.py
 │   ├── decorators.py
 │   └── logging_config.py
 ├── main.py
@@ -221,6 +222,12 @@ COINGECKO_DEMO_API_KEY
 
 ```cmd
 uv run python main.py
+```
+
+Также поддерживается запуск через консольную точку входа из `pyproject.toml`:
+
+```cmd
+uv run valutatrade-hub
 ```
 
 После запуска появляется приглашение:
@@ -574,7 +581,7 @@ uv build
 - Защита актуальных курсов от устаревших записей.
 - Атомарная замена отдельных JSON-файлов.
 - Отказоустойчивость `RatesUpdater`.
-- Фильтрация курсов в CLI.
+- Фильтрация и пересчёт курсов в Parser Service с табличным выводом в CLI.
 
 Тестирование с подменёнными HTTP-ответами не подтверждает доступность реальных внешних API. Реальное подключение проверяется отдельно.
 
