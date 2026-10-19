@@ -1,8 +1,5 @@
 import argparse
-import re
 import shlex
-from datetime import UTC, datetime
-from math import isfinite
 
 from prettytable import PrettyTable
 
@@ -20,9 +17,7 @@ from valutatrade_hub.core.usecases import (
     sell,
     show_portfolio,
 )
-from valutatrade_hub.infra.settings import SettingsLoader
-from valutatrade_hub.parser_service.config import ParserConfig
-from valutatrade_hub.parser_service.storage import RatesStorage
+from valutatrade_hub.parser_service.rate_queries import query_rates
 from valutatrade_hub.parser_service.updater import RatesUpdater
 
 
@@ -93,131 +88,35 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _fresh_quotes() -> tuple[dict[str, tuple[float, datetime, str]], str]:
-    """Читает и проверяет актуальные котировки относительно USD."""
-    cache = RatesStorage().load_cache()
-    pairs = cache.get("pairs", {})
-
-    if not pairs:
-        return {}, ""
-
-    ttl = SettingsLoader().get("rates_ttl_seconds", 300)
-    if (
-        isinstance(ttl, bool)
-        or not isinstance(ttl, (int, float))
-        or not isfinite(ttl)
-        or ttl < 0
-    ):
-        raise ValueError("TTL курсов должен быть конечным неотрицательным числом")
-
-    now = datetime.now(UTC)
-    fresh: dict[str, tuple[float, datetime, str]] = {}
-
-    for pair, entry in pairs.items():
-        if not isinstance(pair, str) or not re.fullmatch(r"[A-Z]{2,5}_USD", pair):
-            continue
-        if not isinstance(entry, dict):
-            continue
-
-        rate = entry.get("rate")
-        timestamp = entry.get("updated_at")
-        source = entry.get("source", "неизвестен")
-        if (
-            isinstance(rate, bool)
-            or not isinstance(rate, (int, float))
-            or not isinstance(timestamp, str)
-            or not isinstance(source, str)
-        ):
-            continue
-
-        try:
-            rate = float(rate)
-            updated_at = datetime.fromisoformat(timestamp)
-        except (OverflowError, ValueError):
-            continue
-
-        if not isfinite(rate) or rate <= 0 or updated_at.utcoffset() is None:
-            continue
-
-        updated_at = updated_at.astimezone(UTC)
-        age = (now - updated_at).total_seconds()
-        if 0 <= age < ttl:
-            fresh[pair.split("_")[0]] = (rate, updated_at, source)
-
-    last_refresh = cache.get("last_refresh")
-    return fresh, last_refresh if isinstance(last_refresh, str) else ""
-
-
 def show_rates(
     currency: str | None = None,
     top: int | None = None,
     base: str = "USD",
 ) -> str:
-    """Возвращает таблицу свежих курсов с фильтрами из задания."""
-    if top is not None and top <= 0:
-        raise ValueError("Значение --top должно быть положительным")
+    """Представляет котировки, полученные от Parser Service, в таблице CLI."""
+    listing = query_rates(currency=currency, top=top, base=base)
 
-    base_code = base.strip().upper()
-    if not re.fullmatch(r"[A-Z]{2,5}", base_code):
-        raise ValueError("Некорректная базовая валюта")
-
-    currency_code = currency.strip().upper() if currency is not None else None
-    if currency_code is not None and not re.fullmatch(r"[A-Z]{2,5}", currency_code):
-        raise ValueError("Некорректный код валюты")
-
-    quotes, last_refresh = _fresh_quotes()
-    if not quotes:
-        return "Локальный кеш курсов пуст или устарел. Выполните 'update-rates'."
-
-    if base_code == "USD":
-        base_price = 1.0
-        base_time = datetime.now(UTC)
-    else:
-        if base_code not in quotes:
-            raise ApiRequestError(
-                f"Курс {base_code}_USD отсутствует или устарел. Выполните update-rates."
-            )
-        base_price, base_time, _ = quotes[base_code]
-
-    codes = sorted(quotes)
-    if currency_code is not None:
-        if currency_code not in quotes:
-            return f"Курс для '{currency_code}' не найден в актуальном кеше."
-        codes = [currency_code]
-
-    if top is not None:
-        crypto_codes = set(ParserConfig().crypto_currencies)
-        codes = [code for code in codes if code in crypto_codes]
-        codes.sort(key=lambda code: (-quotes[code][0], code))
-        codes = codes[:top]
-        if not codes:
-            return "В кеше нет актуальных курсов криптовалют. Выполните 'update-rates'."
+    if listing.message is not None:
+        return listing.message
 
     table = PrettyTable()
     table.field_names = ["Пара", "Курс", "Источник", "Обновлено (UTC)"]
     table.align = "l"
 
-    for code in codes:
-        usd_price, updated_at, source = quotes[code]
-        rate = usd_price / base_price
-        if not isfinite(rate) or rate <= 0:
-            continue
-        rate_text = f"{rate:.8f}" if rate < 1 else f"{rate:,.2f}"
+    for quote in listing.quotes:
+        rate_text = f"{quote.rate:.8f}" if quote.rate < 1 else f"{quote.rate:,.2f}"
         table.add_row(
             [
-                f"{code}_{base_code}",
+                quote.pair,
                 rate_text,
-                source,
-                min(updated_at, base_time).strftime("%Y-%m-%d %H:%M:%S"),
+                quote.source,
+                quote.updated_at.strftime("%Y-%m-%d %H:%M:%S"),
             ]
         )
 
-    if not table.rows:
-        raise ApiRequestError("Не удалось рассчитать курсы. Выполните update-rates.")
-
     return (
-        f"Курсы из кеша (последнее обновление: {last_refresh or 'неизвестно'}):\n"
-        f"{table}"
+        f"Курсы из кеша (последнее обновление: "
+        f"{listing.last_refresh or 'неизвестно'}):\n{table}"
     )
 
 
