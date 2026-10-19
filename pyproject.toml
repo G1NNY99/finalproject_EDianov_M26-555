@@ -1,11 +1,15 @@
 [project]
 name = "valutatrade-hub"
 version = "0.1.0"
+description = "Консольная платформа для отслеживания валютных портфелей и симуляции торговли валютами"
 requires-python = ">=3.12"
 dependencies = [
     "prettytable>=3.18.0",
     "requests>=2.34.2",
 ]
+
+[project.scripts]
+valutatrade-hub = "valutatrade_hub.cli.interface:main"
 
 [dependency-groups]
 dev = [
